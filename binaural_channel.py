@@ -1,4 +1,6 @@
+import argparse
 import os
+from pathlib import Path
 import numpy as np
 import soundfile as sf
 import pysofaconventions
@@ -47,11 +49,7 @@ def binaural_convolve(audio_714, hrtf_l_list, hrtf_r_list):
     return out
 
 
-def main():
-    input_path = "./test.wav"
-    output_path = "./output_binaural.wav"
-    sofa_path = "./HRIR_L2702.sofa"
-
+def build_hrtf_filters(sofa_path):
     # 1. Define 7.1.4 loudspeaker angles
     ls_deg = [
         (-30, 0), (30, 0), (0, 0), (0, 0),
@@ -95,6 +93,10 @@ def main():
         hrtf_l_list.append(h_l)
         hrtf_r_list.append(h_r)
 
+    return hrtf_l_list, hrtf_r_list
+
+
+def process_file(input_path, output_path, hrtf_l_list, hrtf_r_list, target_lufs):
     # 7. Convolution
     audio_714, sr = sf.read(input_path)
     binaural_audio = binaural_convolve(audio_714, hrtf_l_list, hrtf_r_list)
@@ -102,9 +104,96 @@ def main():
     # 8. LUFS normalization
     meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(binaural_audio)
-    binaural_audio = pyln.normalize.loudness(binaural_audio, loudness, -24.0)
+    binaural_audio = pyln.normalize.loudness(binaural_audio, loudness, target_lufs)
 
     sf.write(output_path, binaural_audio, sr)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Convert 7.1.4 multichannel audio to binaural output."
+    )
+    parser.add_argument(
+        "--input-path",
+        default="./test.wav",
+        help="Path to a single multichannel input file (used when --input-dir is not set).",
+    )
+    parser.add_argument(
+        "--input-dir",
+        help="Directory of multichannel input files to process in batch mode.",
+    )
+    parser.add_argument(
+        "--output-path",
+        default="./output_binaural.wav",
+        help="Path for single-file output (used when --input-dir is not set).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./binaural_outputs",
+        help="Output directory for batch mode.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="_binaural",
+        help="Suffix appended to each batch output filename.",
+    )
+    parser.add_argument(
+        "--sofa-path",
+        default="./HRIR_L2702.sofa",
+        help="Path to SOFA HRTF file.",
+    )
+    parser.add_argument(
+        "--target-lufs",
+        type=float,
+        default=-24.0,
+        help="Target LUFS for loudness normalization.",
+    )
+    return parser.parse_args()
+
+
+def collect_audio_files(input_dir):
+    audio_exts = {".wav", ".flac", ".aif", ".aiff", ".ogg"}
+    return sorted(
+        file_path for file_path in input_dir.iterdir()
+        if file_path.is_file() and file_path.suffix.lower() in audio_exts
+    )
+
+
+def main():
+    args = parse_args()
+    hrtf_l_list, hrtf_r_list = build_hrtf_filters(args.sofa_path)
+
+    if args.input_dir:
+        input_dir = Path(args.input_dir)
+        if not input_dir.is_dir():
+            raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        input_files = collect_audio_files(input_dir)
+        if not input_files:
+            raise FileNotFoundError(f"No supported audio files found in: {input_dir}")
+
+        for input_file in input_files:
+            output_file = output_dir / f"{input_file.stem}{args.output_suffix}.wav"
+            print(f"Processing: {input_file} -> {output_file}")
+            process_file(
+                str(input_file),
+                str(output_file),
+                hrtf_l_list,
+                hrtf_r_list,
+                args.target_lufs,
+            )
+    else:
+        process_file(
+            args.input_path,
+            args.output_path,
+            hrtf_l_list,
+            hrtf_r_list,
+            args.target_lufs,
+        )
+
 
 if __name__ == "__main__":
     main()
