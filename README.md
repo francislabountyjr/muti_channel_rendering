@@ -44,3 +44,13 @@ In batch mode, each supported audio file in `--input-dir` is rendered to:
 Supported input extensions:
 
 - `.wav`, `.flac`, `.aif`, `.aiff`, `.ogg`
+
+## Channel layout
+
+The renderer expects 7.1.4 channels in Cavernize/WAVEX order:
+
+- `FL FR FC LFE BL BR SL SR TFL TFR TBL TBR`
+
+For `.wav` inputs, the script reads the WAV extensible channel mask when present and
+reorders channels to that layout before binaural rendering. If no mask is present,
+it assumes the file is already in that order.

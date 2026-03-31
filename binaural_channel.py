@@ -1,13 +1,63 @@
 import argparse
-import os
+import struct
 from pathlib import Path
 import numpy as np
 import soundfile as sf
 import pysofaconventions
-import spaudiopy as spa
 from scipy.signal import fftconvolve
 import pyloudnorm as pyln
 from spaudiopy import decoder
+
+EXPECTED_714_ORDER = (
+    "FL",
+    "FR",
+    "FC",
+    "LFE",
+    "BL",
+    "BR",
+    "SL",
+    "SR",
+    "TFL",
+    "TFR",
+    "TBL",
+    "TBR",
+)
+EXPECTED_714_MASK = 0x2D63F
+SPEAKER_ANGLES_DEG = {
+    "FL": (-30, 0),
+    "FR": (30, 0),
+    "FC": (0, 0),
+    "LFE": (0, 0),
+    "BL": (-135, 0),
+    "BR": (135, 0),
+    "SL": (-110, 0),
+    "SR": (110, 0),
+    "TFL": (-45, 45),
+    "TFR": (45, 45),
+    "TBL": (-135, 45),
+    "TBR": (135, 45),
+}
+_SPEAKER_BITS = (
+    (0x00001, "FL"),
+    (0x00002, "FR"),
+    (0x00004, "FC"),
+    (0x00008, "LFE"),
+    (0x00010, "BL"),
+    (0x00020, "BR"),
+    (0x00040, "FLC"),
+    (0x00080, "FRC"),
+    (0x00100, "BC"),
+    (0x00200, "SL"),
+    (0x00400, "SR"),
+    (0x00800, "TC"),
+    (0x01000, "TFL"),
+    (0x02000, "TFC"),
+    (0x04000, "TFR"),
+    (0x08000, "TBL"),
+    (0x10000, "TBC"),
+    (0x20000, "TBR"),
+)
+_KNOWN_SPEAKER_MASK_BITS = sum(bit for bit, _ in _SPEAKER_BITS)
 
 
 def load_hrtf(sofa_path):
@@ -29,8 +79,87 @@ def spherical_to_cartesian(az_deg, el_deg, r=1.0):
     return x, y, z
 
 
+def read_wav_channel_mask(input_path):
+    path = Path(input_path)
+    if path.suffix.lower() != ".wav":
+        return None
+
+    with path.open("rb") as handle:
+        if handle.read(4) != b"RIFF":
+            return None
+        handle.seek(8)
+        if handle.read(4) != b"WAVE":
+            return None
+        handle.seek(12)
+
+        while True:
+            chunk_header = handle.read(8)
+            if len(chunk_header) < 8:
+                return None
+
+            chunk_id, chunk_size = struct.unpack("<4sI", chunk_header)
+            if chunk_id == b"fmt ":
+                fmt_chunk = handle.read(chunk_size)
+                if len(fmt_chunk) < 40:
+                    return None
+
+                format_tag = struct.unpack_from("<H", fmt_chunk, 0)[0]
+                if format_tag != 0xFFFE:
+                    return None
+                return struct.unpack_from("<I", fmt_chunk, 20)[0]
+
+            handle.seek(chunk_size + (chunk_size % 2), 1)
+
+
+def speakers_from_channel_mask(channel_mask):
+    unknown_bits = channel_mask & ~_KNOWN_SPEAKER_MASK_BITS
+    if unknown_bits:
+        raise ValueError(f"Unsupported channel mask bits: 0x{unknown_bits:X}")
+    return [speaker for bit, speaker in _SPEAKER_BITS if channel_mask & bit]
+
+
+def reorder_to_expected_714(audio_714, input_path):
+    if audio_714.ndim != 2:
+        raise ValueError(f"Expected 2D audio array, got shape={audio_714.shape}")
+    if audio_714.shape[1] != len(EXPECTED_714_ORDER):
+        raise ValueError(
+            f"Expected 12 channels for 7.1.4 input, got {audio_714.shape[1]} in {input_path}"
+        )
+
+    channel_mask = read_wav_channel_mask(input_path)
+    if not channel_mask:
+        print(
+            f"No WAVEX channel mask found for {input_path}; "
+            "assuming Cavernize/WAVEX 7.1.4 order."
+        )
+        return audio_714
+    if channel_mask == EXPECTED_714_MASK:
+        return audio_714
+
+    speaker_order = speakers_from_channel_mask(channel_mask)
+    if set(speaker_order) != set(EXPECTED_714_ORDER):
+        raise ValueError(
+            f"Unsupported 7.1.4 speaker set in {input_path}: "
+            f"mask=0x{channel_mask:X} speakers={speaker_order}"
+        )
+
+    if tuple(speaker_order) == EXPECTED_714_ORDER:
+        return audio_714
+
+    reorder_idx = [speaker_order.index(name) for name in EXPECTED_714_ORDER]
+    print(
+        f"Reordering channels for {input_path} from {speaker_order} "
+        f"to {list(EXPECTED_714_ORDER)}"
+    )
+    return audio_714[:, reorder_idx]
+
+
 
 def binaural_convolve(audio_714, hrtf_l_list, hrtf_r_list):
+    if audio_714.ndim != 2 or audio_714.shape[1] != len(EXPECTED_714_ORDER):
+        raise ValueError(
+            f"Expected audio shaped [samples, 12], got {audio_714.shape}"
+        )
     max_hrtf_len = max(len(h) for h in hrtf_l_list)
     n_samples = audio_714.shape[0] + max_hrtf_len - 1
     out = np.zeros((n_samples, 2))  # stereo
@@ -51,11 +180,7 @@ def binaural_convolve(audio_714, hrtf_l_list, hrtf_r_list):
 
 def build_hrtf_filters(sofa_path):
     # 1. Define 7.1.4 loudspeaker angles
-    ls_deg = [
-        (-30, 0), (30, 0), (0, 0), (0, 0),
-        (-110, 0), (110, 0), (-135, 0), (135, 0),
-        (-45, 45), (45, 45), (-135, 45), (135, 45),
-    ]
+    ls_deg = [SPEAKER_ANGLES_DEG[speaker] for speaker in EXPECTED_714_ORDER]
     # Convert negative azimuth angles to 0-360 degrees
     ls_deg = [(az+360 if az<0 else az, el) for az, el in ls_deg]
 
@@ -75,11 +200,11 @@ def build_hrtf_filters(sofa_path):
     # 6. Interpolate HRTF using weights
     hrtf_l_list = []
     hrtf_r_list = []
-    for ch in range(12):
+    for ch, speaker in enumerate(EXPECTED_714_ORDER):
         weights = vbap_gains[ch]
         nonzero_idx = np.where(weights != 0)[0]
         az, el = ls_deg[ch]
-        print(f"Channel {ch}: angle (azimuth={az}, elevation={el})")
+        print(f"Channel {ch} ({speaker}): angle (azimuth={az}, elevation={el})")
         print(f" 3 HRTF indices: {nonzero_idx}")
         print("  Corresponding angles and weights:")
         for idx in nonzero_idx:
@@ -98,7 +223,8 @@ def build_hrtf_filters(sofa_path):
 
 def process_file(input_path, output_path, hrtf_l_list, hrtf_r_list, target_lufs):
     # 7. Convolution
-    audio_714, sr = sf.read(input_path)
+    audio_714, sr = sf.read(input_path, always_2d=True)
+    audio_714 = reorder_to_expected_714(audio_714, input_path)
     binaural_audio = binaural_convolve(audio_714, hrtf_l_list, hrtf_r_list)
 
     # 8. LUFS normalization
